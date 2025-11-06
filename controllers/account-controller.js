@@ -28,7 +28,7 @@ const generateToken = require("../utils/generateToken");
 exports.createAccount = async (req, res) => {
   console.log("➡️ Controller hit: createAccount");
   try {
-    const { account_type, account_name, full_name, email, nickname } = req.body;
+    const { account_type, account_name, first_name, last_name, email, nickname } = req.body;
     console.log("📩 Received body:", req.body);
 
     // 1️⃣ Validate base input
@@ -84,8 +84,8 @@ exports.createAccount = async (req, res) => {
 
     // 🔹 Case 2: Creator account (standalone user, no Account)
     if (account_type === "creator") {
-      if (!full_name || !email) {
-        return res.status(400).json({ error: "full_name and email are required for creator" });
+      if (!first_name || !last_name || !email) {
+        return res.status(400).json({ error: "first_name, last_name and email are required for creator" });
       }
 
       // Check if user already exists
@@ -110,8 +110,8 @@ exports.createAccount = async (req, res) => {
 
       // Create the invited user (not yet active)
       const newUser = await User.create({
-        name: nickname || full_name,
-        full_name,
+        first_name,
+        last_name,
         email,
         password: randomPassword,
         role: creatorRole._id,
@@ -132,7 +132,7 @@ exports.createAccount = async (req, res) => {
       await newUser.save();
 
       // Send invitation email
-      await sendInvitationEmail(email, resetToken, full_name);
+      await sendInvitationEmail(email, resetToken, first_name, last_name);
       console.log("📧 Password setup email sent to:", email);
 
       return res.status(201).json({
@@ -159,9 +159,9 @@ exports.createSuperuser = async (req, res) => {
   try {
     console.log("➡️ Controller hit: createSuperuser");
 
-    const { full_name, email, enterprise_name } = req.body;
+    const { first_name, last_name, email, enterprise_name } = req.body;
 
-    if (!full_name || !email || !enterprise_name) {
+    if (!first_name || !last_name || !email || !enterprise_name) {
       return res.status(400).json({ error: "All fields are required" });
     }
 
@@ -193,7 +193,8 @@ exports.createSuperuser = async (req, res) => {
 
     // 5️⃣ Create the user
     const superuser = await User.create({
-      name: full_name,
+      first_name,
+      last_name,
       email,
       password: randomPassword,
       account: account._id,
@@ -211,7 +212,7 @@ exports.createSuperuser = async (req, res) => {
     superuser.reset_token_expires_at = Date.now() + 3600000;
     await superuser.save();
 
-    await sendInvitationEmail(email, resetToken, full_name);
+    await sendInvitationEmail(email, resetToken, first_name, last_name);
 
     console.log("✅ Superuser created:", superuser.email);
     return res.status(201).json({
@@ -223,6 +224,56 @@ exports.createSuperuser = async (req, res) => {
     });
   } catch (err) {
     console.error("🔥 Error creating superuser:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
+ * POST /api/accounts/login
+ * Body: { email, password }
+ */
+exports.loginUser = async (req, res) => {
+  try {
+    console.log("➡️ Login controller hit");
+
+    const { email, password } = req.body;
+    console.log("📩 Received body:", req.body);
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required." });
+    }
+
+    const user = await User.findOne({ email }).populate("role").populate("account");
+    if (!user) {
+      console.warn("⚠️ User not found:", email);
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      console.warn("⚠️ Invalid password for:", email);
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    // ✅ Generate token with only user._id
+    const token = generateToken(user);
+
+    console.log("✅ Login successful for:", user.email);
+    res.status(200).json({
+      message: "Login successful.",
+      success: true,
+      token,
+      user: {
+        id: user._id,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        email: user.email,
+        role: user.role?.name,
+        account: user.account?.name,
+      },
+    });
+  } catch (err) {
+    console.error("🔥 Error logging in user:", err);
     res.status(500).json({ error: "Internal Server Error" });
   }
 };
@@ -258,23 +309,36 @@ exports.setPassword = async (req, res) => {
       reset_token_expires_at: { $gt: Date.now() },
     });
 
-    if (!user) {
-      console.log("❌ No user found for token or token expired");
-      return res.status(400).json({ error: "Invalid or expired token" });
+    // if (!user) {
+    //   console.log("❌ No user found for token or token expired");
+    //   return res.status(400).json({ error: "Invalid or expired token" });
+    // }
+
+    if (!user || user.reset_token !== token) {
+      console.log("❌ This link has already been used or replaced.");
+      return res.status(400).json({ 
+        error: "This link has already been used or replaced.",
+        code: "TOKEN_USED" 
+      });
     }
 
-    // 3️⃣ Hash new password
-    const hashedPassword = await bcrypt.hash(new_password, 10);
+    if (user.reset_token_expires_at < Date.now()) {
+      console.log("❌ Token expired based on DB timestamp");
+      return res.status(400).json({
+        error: "This password reset link has expired. Please request a new one.",
+        code: "TOKEN_EXPIRED"
+      });
+    }
 
     // 4️⃣ Update user record
-    user.password = hashedPassword;
+    user.password = new_password;
     user.status = "active";
     user.reset_token = undefined;
     user.reset_token_expires_at = undefined;
 
-    await user.save();
+    await user.save({ validateBeforeSave: false });
 
-    console.log("✅ Password updated successfully for user:", user.email);
+    console.log("✅ Password updated successfully for user and token cleared:", user.email);
 
     res.status(200).json({
       message: "Password updated successfully. You can now log in.",
@@ -330,5 +394,58 @@ exports.forgotPassword = async (req, res) => {
   } catch (error) {
     console.error("🔥 Error in forgotPassword:", error);
     return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+exports.verifyResetToken = async (req, res) => {
+  const { token } = req.body;
+  console.log("➡️ Controller hit: verifyResetToken");
+  console.log("📩 Received token:", token ? token.substring(0, 25) + "..." : "❌ No token provided");
+
+  try {
+    // 1️⃣ Verify the JWT token’s integrity & expiry (cryptographic check)
+    console.log("🔍 Verifying JWT token integrity...");
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log("✅ JWT verified successfully:", decoded);
+
+    // 2️⃣ Match token in DB and ensure it hasn't expired (DB check)
+    console.log("🧩 Searching user by decoded ID:", decoded.id);
+    const user = await User.findOne({ _id: decoded.id, reset_token: token });
+
+    if (!user) {
+      console.log("❌ No user found for this token.");
+      return res.status(200).json({ 
+        success: false,
+        error: "This password reset link has already been used or replaced.",
+        code: "TOKEN_USED"
+      });
+    }
+
+    console.log("👤 Found user:", user.email);
+    console.log("🕓 Token expiry check:", new Date(user.reset_token_expires_at), "vs", new Date());
+
+    if (user.reset_token_expires_at < Date.now()) {
+      console.log("❌ Token expired (based on DB expiry timestamp).");
+      return res.status(200).json({ 
+        success: false,
+        error: "This password reset link has expired. Please request a new one.",
+        code: "TOKEN_EXPIRED"
+      });
+    }
+
+    // ✅ Token is good
+    console.log("✅ Token is valid and active for user:", user.email);
+    res.status(200).json({ 
+      success: true,
+      message: "Token is valid and active for user.",
+    });
+  } catch (error) {
+    // ❌ Token is invalid, malformed, or expired at JWT level
+    console.error("❌ JWT verification failed:", error.message);
+    res.status(400).json({ 
+        success: false,
+        error: "Malformed or expired token.",
+        code: "TOKEN_USED"
+     });
   }
 };

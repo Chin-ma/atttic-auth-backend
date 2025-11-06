@@ -17,11 +17,11 @@ exports.addUser = async (req, res) => {
   console.log("➡️ Controller hit: addUser");
 
   try {
-    const { full_name, email, role_name } = req.body;
+    const { first_name, last_name, email, role_name } = req.body;
 
     // 1️⃣ Validate input
-    if (!full_name || !email) {
-      return res.status(400).json({ error: "full_name and email are required" });
+    if (!first_name || !last_name || !email) {
+      return res.status(400).json({ error: "First name, last name and email are required" });
     }
 
     // 2️⃣ Ensure authenticated user (the inviter)
@@ -53,8 +53,8 @@ exports.addUser = async (req, res) => {
 
     // 6️⃣ Create user (pending invite)
     const newUser = await User.create({
-      name: full_name,
-      full_name,
+      first_name,
+      last_name,
       email,
       account: inviter.account, // link to the same enterprise account
       role: memberRole._id,
@@ -73,7 +73,7 @@ exports.addUser = async (req, res) => {
     await newUser.save();
 
     // 8️⃣ Send invitation email
-    await sendInvitationEmail(email, resetToken, full_name);
+    await sendInvitationEmail(email, resetToken, first_name, last_name);
 
     console.log("📧 Invitation email sent to:", email);
 
@@ -89,55 +89,6 @@ exports.addUser = async (req, res) => {
     });
   } catch (error) {
     console.error("🔥 Error adding user:", error);
-    res.status(500).json({ error: "Internal Server Error" });
-  }
-};
-
-/**
- * POST /api/accounts/login
- * Body: { email, password }
- */
-exports.loginUser = async (req, res) => {
-  try {
-    console.log("➡️ Login controller hit");
-
-    const { email, password } = req.body;
-    console.log("📩 Received body:", req.body);
-
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required." });
-    }
-
-    const user = await User.findOne({ email }).populate("role").populate("account");
-    if (!user) {
-      console.warn("⚠️ User not found:", email);
-      return res.status(401).json({ error: "Invalid credentials." });
-    }
-
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      console.warn("⚠️ Invalid password for:", email);
-      return res.status(401).json({ error: "Invalid credentials." });
-    }
-
-    // ✅ Generate token with only user._id
-    const token = generateToken(user);
-
-    console.log("✅ Login successful for:", user.email);
-    res.status(200).json({
-      message: "Login successful.",
-      success: true,
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role?.name,
-        account: user.account?.name,
-      },
-    });
-  } catch (err) {
-    console.error("🔥 Error logging in user:", err);
     res.status(500).json({ error: "Internal Server Error" });
   }
 };
@@ -196,8 +147,8 @@ exports.getUser = async (req, res) => {
     res.status(200).json({
       id: userData._id,
       user_id: userData.user_id,
-      name: userData.name,
-      full_name: userData.full_name,
+      first_name: userData.first_name,
+      last_name: userData.last_name,
       email: userData.email,
       role: userData.role
         ? {
@@ -223,57 +174,135 @@ exports.getUser = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/accounts/users
+ * Headers: Authorization: Bearer <token>
+ * Description:
+ * - Fetch all users under the same enterprise account as the logged-in user
+ * - Excludes enterprise_admin users
+ */
 exports.getUsersByAccount = async (req, res) => {
-  console.log("➡️ Controller hit: getUserByAccount");
+  console.log("➡️ Controller hit: getUsersByAccount");
+
   try {
-    const { account_id } = req.params;
-    const user = await User.find({ account: account_id });
-    if (!user) {
-      console.log("❌ User not found");
-      return res.status(404).json({ error: "User not found" });
+    // 1️⃣ Ensure user is authenticated (middleware populates req.user)
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      return res.status(401).json({ error: "Unauthorized" });
     }
-    res.status(200).json(user);
+
+    // 2️⃣ Ensure the user is a superuser under an enterprise account
+    if (!currentUser.account || currentUser.role?.name !== "enterprise_admin") {
+      return res.status(403).json({ error: "Only enterprise admins can view account users" });
+    }
+
+    // 3️⃣ Find all users under the same account, excluding superusers
+    const users = await User.find({
+      account: currentUser.account._id,
+    })
+      .populate("role", "name description permissions")
+      .select("-password -reset_token -reset_token_expires_at")
+      .lean();
+
+    // 4️⃣ Filter out other superusers from the result
+    const filteredUsers = users.filter(
+      (user) => user.role?.name !== "enterprise_admin"
+    );
+
+    console.log(`✅ Found ${filteredUsers.length} users under account: ${currentUser.account.name}`);
+
+    res.status(200).json({
+      account: {
+        id: currentUser.account._id,
+        name: currentUser.account.name,
+      },
+      count: filteredUsers.length,
+      users: filteredUsers.map((u) => ({
+        id: u._id,
+        first_name: u.first_name,
+        last_name: u.last_name,
+        email: u.email,
+        role: u.role?.name,
+        status: u.status,
+        created_at: u.createdAt,
+      })),
+    });
   } catch (error) {
-    console.error("🔥 Error fetching user by account:", error);
+    console.error("🔥 Error fetching users by account:", error);
     res.status(500).json({ error: "Internal Server Error" });
   }
 };
 
 /**
- * DELETE /api/accounts/user/:user_id
+ * DELETE /api/users/delete
  * Requires: Bearer token (for authorization)
  */
 exports.deleteUser = async (req, res) => {
   console.log("➡️ Controller hit: deleteUser");
+
   try {
-    const { user_id } = req.params;
+    // 1️⃣ Extract authenticated user from middleware
+    const currentUser = req.user;
 
-    // 1️⃣ Validate
-    if (!user_id) {
-      return res.status(400).json({ error: "user_id is required" });
+    if (!currentUser) {
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // 2️⃣ Find the user by custom user_id
-    const user = await User.findOne({ user_id });
-    if (!user) {
-      console.log("❌ User not found:", user_id);
-      return res.status(404).json({ error: "User not found" });
+    // 2️⃣ Check if user has permission to delete
+    // enterprise_admin can delete users in their account
+    // creator_admin can delete their own account only
+    if (
+      currentUser.role?.name === "enterprise_admin"
+    ) {
+      // Enterprise admin deleting someone else — needs target user in body
+      const { email } = req.body;
+
+      if (!email) {
+        return res.status(400).json({ error: "Target user's email is required" });
+      }
+
+      // 3️⃣ Find target user under same enterprise account
+      const targetUser = await User.findOne({
+        email,
+        account: currentUser.account._id,
+      });
+
+      if (!targetUser) {
+        console.log("❌ Target user not found:", email);
+        return res.status(404).json({ error: "User not found in your account" });
+      }
+
+      // Prevent deleting another admin
+      if (targetUser.role?.toString() === currentUser.role?._id.toString()) {
+        return res.status(403).json({ error: "Cannot delete another enterprise admin" });
+      }
+
+      await targetUser.deleteOne();
+      console.log("✅ Enterprise Admin deleted user:", targetUser.email);
+
+      return res.status(200).json({
+        message: "User deleted successfully.",
+        deleted_user_email: targetUser.email,
+      });
     }
 
-    // (Optional) 3️⃣ Add access control
-    // For example: only enterprise_admin or creator_admin can delete
-    // if (req.user.role.name !== "enterprise_admin" && req.user.role.name !== "creator_admin") {
-    //   return res.status(403).json({ error: "Unauthorized: insufficient permissions" });
-    // }
+    // 4️⃣ Creator or regular user deleting themselves
+    if (
+      ["creator_admin", "enterprise_member"].includes(currentUser.role?.name)
+    ) {
+      await User.deleteOne({ _id: currentUser._id });
+      console.log("✅ User self-deleted:", currentUser.email);
 
-    // 4️⃣ Delete user
-    await user.deleteOne();
+      return res.status(200).json({
+        message: "Your account has been deleted successfully.",
+        deleted_email: currentUser.email,
+      });
+    }
 
-    console.log("✅ User deleted:", user.email);
-    return res.status(200).json({
-      message: "User deleted successfully.",
-      deleted_user_id: user.user_id,
-      email: user.email,
+    // 5️⃣ Fallback — no matching role
+    return res.status(403).json({
+      error: "Unauthorized: insufficient permissions",
     });
   } catch (error) {
     console.error("🔥 Error deleting user:", error);
