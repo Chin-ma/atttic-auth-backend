@@ -2,6 +2,7 @@ const Account = require("../models/account");
 const AccountType = require("../models/account-type");
 const Role = require("../models/role");
 const User = require("../models/user");
+const Project = require("../models/project");
 const { customAlphabet } = require("nanoid");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -255,8 +256,14 @@ exports.loginUser = async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
+    const userProject = await Project.findOne({ owner: user._id });
+    // console.log("🔍 User project:", userProject);
+    if (userProject) {
+      user.current_project = userProject._id;
+    }
+
     // ✅ Generate token with only user._id
-    const token = generateToken(user);
+    const token = generateToken(user, userProject._id);
 
     console.log("✅ Login successful for:", user.email);
     res.status(200).json({
@@ -270,6 +277,7 @@ exports.loginUser = async (req, res) => {
         email: user.email,
         role: user.role?.name,
         account: user.account?.name,
+        current_project: user.current_project || null
       },
     });
   } catch (err) {
